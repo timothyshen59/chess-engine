@@ -1,0 +1,20 @@
+# Layer 1 — data ingestion
+chess>=1.10.0          # PGN parsing + board state
+zstandard>=0.22.0      # decompress .pgn.zst dumps
+polars>=0.20.0         # fast DataFrame + Parquet I/O
+requests>=2.31.0       # Lichess API + dump downloads
+ 
+# Layer 2 — feature store (install now, use next)
+duckdb>=0.10.0         # SQL over Parquet files
+ 
+# Layer 3 — ML training
+torch>=2.2.0
+xgboost>=2.0.0
+scikit-learn>=1.4.0
+numpy>=1.26.0
+ 
+# Layer 4 — model serving
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0
+pydantic>=2.0.0
+ 

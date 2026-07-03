@@ -1,0 +1,49 @@
+[project]
+name = "chess-project"
+version = "0.1.0"
+description = "Chess move quality predictor and rating estimator"
+requires-python = ">=3.11"
+
+dependencies = [
+    # Layer 1 — data ingestion
+    "chess>=1.10.0",
+    "zstandard>=0.22.0",
+    "polars>=0.20.0",
+    "requests>=2.31.0",
+    # Layer 2 — feature store
+    "duckdb>=0.10.0",
+    # Layer 3 — ML training
+    "torch>=2.2.0",
+    "xgboost>=2.0.0",
+    "scikit-learn>=1.4.0",
+    "numpy>=1.26.0",
+    # Layer 4 — model serving
+    "fastapi>=0.110.0",
+    "uvicorn[standard]>=0.27.0",
+    "pydantic>=2.0.0",
+    "berserk>=0.14.0",
+    "tqdm>=4.66.0",
+    "pyarrow>=24.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "ruff>=0.4.0",       # linter + formatter (replaces black + flake8)
+    "ipykernel>=6.0.0",  # Jupyter for exploration
+]
+
+[tool.uv]
+package = false
+dev-dependencies = [
+    "pytest>=8.0.0",
+    "ruff>=0.4.0",
+    "ipykernel>=6.0.0",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]   # pycodestyle + pyflakes + isort
