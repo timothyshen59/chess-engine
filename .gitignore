@@ -1,10 +1,41 @@
-# Python-generated files
+# Python
 __pycache__/
-*.py[oc]
-build/
-dist/
-wheels/
-*.egg-info
+*.py[cod]
+*.pyo
+*.pyd
+.Python
 
-# Virtual environments
-.venv
+# uv / venv
+.venv/
+venv/
+uv.lock
+
+# Data 
+data/raw/
+data/processed/
+data/features/
+data/labels/
+
+# Model weights
+models/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# macOS
+.DS_Store
+
+# env files — never commit secrets
+.env
+.env.*
+
+# IDE
+.vscode/
+.idea/
+
+# Logs
+*.log
+
+# Stockfish binary if accidentally downloaded here
+stockfish
