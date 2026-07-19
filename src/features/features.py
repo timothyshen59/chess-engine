@@ -40,22 +40,8 @@ ATTACK_WEIGHTS = {
 
 #Ppsitional Features 
 
-def compute_num_legal_moves(fen: str) -> int: 
-    """Compute legal moves available in position"""
-    board = chess.Board(fen) 
-    
-    return len(list(board.legal_moves))
 
-def compute_material_balance(fen: str) -> int: 
-    """Compute material balance in centipawns from moving player """
-    board = chess.Board(fen) 
-    
-    white_material = sum(PIECE_VALUES[pt] * len(board.pieces(pt, chess.WHITE)) for pt in PIECE_VALUES)
-    black_material = sum(PIECE_VALUES[pt] * len(board.pieces(pt, chess.BLACK)) for pt in PIECE_VALUES)
-    
-    balance = white_material - black_material 
-    
-    return balance if board.turn == chess.WHITE else -balance 
+
 
 #Might have to revise this one, recompute, and add more features 
 def compute_king_safety_score(fen:str) -> int: 
@@ -132,7 +118,13 @@ def compute_position_features(fens: list[str]) -> dict[str, list]:
         "material_balance":  material,
         "king_safety_score": king_safety,
     }
+    
+    
 
+
+
+def compute_passed_pawns(board: chess.Board) -> int: 
+    
 #Wdinow Featrues (DuckDB) 
 
 #SQL statement for window 

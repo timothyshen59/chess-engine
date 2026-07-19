@@ -8,6 +8,9 @@
 sample:
 	uv run src/ingestion/ingest.py sample --n 50 --perf-type blitz
 
+sample-large: 
+	uv run src/ingestion/ingest.py sample --n 500 --perf-type blitz
+
 # Parse a real dump — usage: make dump PATH=data/raw/lichess_db_...pgn.zst
 dump:
 	uv run src/ingestion/ingest.py dump $(PATH)
@@ -16,24 +19,32 @@ dump:
 
 # Compute all features from processed Parquet
 features:
-	uv run src/features/features.py
+	uv run src/features/pipeline.py
+
 
 # ── Stockfish labels (Layer 2.5) ──────────────────────────────────────────────
 
-# Test Stockfish on 500 rows first — verify it works before full run
-labels-test:
-	uv run src/labels/stockfish.py --max-rows 500 --depth 10
+# Build eval database Parquet — one time only (~8GB download)
+evals-build:
+	uv run src/labels/evals.py build --evals-dir data/evals
 
-# Full label generation (slow — ~90 min for 18k positions at depth 10)
-labels:
-	uv run src/labels/stockfish.py --depth 10
+# Build without re-downloading (if .zst already exists)
+evals-build-skip-download:
+	uv run src/labels/evals.py build --evals-dir data/evals --skip-download
+
+# Generate labels by joining features with evals (seconds)
+evals-label:
+	uv run src/labels/evals.py label
+
+# Scale up partitioning for 2M+ games
+evals-build-large:
+	uv run src/labels/evals.py build --evals-dir data/evals --partition-depth 3
 
 # ── Training (Layer 3) ────────────────────────────────────────────────────────
 
 # Train XGBoost regression model on centipawn loss
 train:
-	uv run src/training/train.py
-
+	uv run src/training/train.py --features-dir data/features --models-dir models
 # ── Full pipeline ─────────────────────────────────────────────────────────────
 
 # Run everything end to end (uses labels-test for speed)

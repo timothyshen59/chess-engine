@@ -15,6 +15,7 @@ data/raw/
 data/processed/
 data/features/
 data/labels/
+data/evals/
 
 # Model weights
 models/

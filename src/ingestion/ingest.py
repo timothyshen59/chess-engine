@@ -1,68 +1,86 @@
-import io 
-import re 
-import random 
-import argparse 
+import io
+import re
+import random
+import argparse
 
-import chess 
-import chess.pgn 
-import zstandard as zstd 
-import polars as pl 
-import berserk #Lichess API 
-from pathlib import Path 
-from dataclasses import dataclass, asdict 
-from typing import Iterator 
+import chess
+import chess.pgn
+import zstandard as zstd
+import polars as pl
+import berserk
+from pathlib import Path
+from dataclasses import dataclass, asdict
 
-@dataclass 
-class MoveRow: 
-    game_id: str 
-    move_number: int 
-    color: str 
-    fen_before: str 
-    move_uci: str 
-    move_san: str 
-    
-    white_elo: int 
-    black_elo: int 
-    result: str 
-    
-    time_control: str 
-    time_control_base: int 
-    time_control_inc: int 
-    time_control_type: str 
-    
-    clock_before: float | None 
-    clock_after: float | None 
-    
-    time_spent: float | None 
-    time_spent_norm: float | None # time_spent/ time_control_base
+
+@dataclass
+class MoveRow:
+    game_id:           str
+    move_number:       int
+    color:             str
+    fen_before:        str
+    move_uci:          str
+    move_san:          str
+
+    white_elo:         int
+    black_elo:         int
+    result:            str
+
+    time_control:      str
+    time_control_base: int
+    time_control_inc:  int
+    time_control_type: str
+
+    clock_before:      float | None
+    clock_after:       float | None
+    time_spent:        float | None
+    time_spent_norm:   float | None
+
+    #Evals from PGN
+    eval_before:       float | None
+    eval_after:        float | None
+    cp_loss:           float | None
+
 
 #Clock Parser
-
 _CLK_RE = re.compile(r'\[%clk\s+(\d+):(\d+):(\d+)\]') # Regex (extracts h:mm:ss)
 
 def _parse_clock(comment: str | None) -> float | None:
     """Extract seconds from a Lichess clock comment. Returns None if absent."""
     if not comment:
         return None
-    
     m = _CLK_RE.search(comment)
-    
     if not m:
         return None
-    
     h, mn, s = int(m.group(1)), int(m.group(2)), int(m.group(3))
     return float(h * 3600 + mn * 60 + s)
 
-def _parse_time_control(tc: str)-> tuple[int, int, str]: 
-    """Parse time control string into (base_seconds, increment, category)"""
-    
-    try: 
-        base, inc = map(int, tc.split("+"))
-    except Exception: 
-        return 0,0, "unknown" #Edge case for unknowns
 
-    estimated = base + 40 * inc #Lichess categorization formula 
-    
+#Eval Parser
+_EVAL_RE = re.compile(r'\[%eval\s+(#?-?\d+\.?\d*)\]')
+
+def _parse_eval(comment: str | None) -> float | None:
+    """Extract Stockfish eval from LiChess PGN comment"""
+    if not comment:
+        return None
+    m = _EVAL_RE.search(comment)
+    if not m:
+        return None
+    val = m.group(1)
+    if val.startswith('#'):
+        mate = int(val[1:])
+        return 10000.0 if mate > 0 else -10000.0
+    return float(val)
+
+
+def _parse_time_control(tc: str) -> tuple[int, int, str]:
+    """Parse time control string into (base_seconds, increment, category)"""
+    try:
+        base, inc = map(int, tc.split("+"))
+    except Exception:
+        return 0, 0, "unknown" #Edge case for unknowns
+
+    estimated = base + 40 * inc #Lichess categorization formula
+
     if estimated < 179:
         category = "bullet"
     elif estimated < 479:
@@ -73,69 +91,78 @@ def _parse_time_control(tc: str)-> tuple[int, int, str]:
         category = "classical"
 
     return base, inc, category
-    
-def _get_clock_before(node: chess.pgn.GameNode, base_seconds: int) -> float: 
-    """
-    Get current player's clock time before amaking this move. 
-    """
-    
-    if node.parent is None or node.parent.parent is None: 
+
+
+def _get_clock_before(node: chess.pgn.GameNode, base_seconds: int) -> float:
+    """Get current player's clock time before making this move."""
+    if node.parent is None or node.parent.parent is None:
         return float(base_seconds) # If no previous move
-    
-    grandparent = node.parent.parent 
+    grandparent = node.parent.parent
     clk = _parse_clock(grandparent.comment)
-    
-    if clk is None: 
-        return float(base_seconds) #Corrupted PGN 
-
-    return clk 
+    if clk is None:
+        return float(base_seconds) #Corrupted PGN
+    return clk
 
 
-#Game Parser 
-def _parse_game(game: chess.pgn.Game) -> list[MoveRow]: 
+#Game Parser
+def _parse_game(game: chess.pgn.Game) -> list[MoveRow]:
     """Turn one PGN game into a list of MoveRow objects"""
-
-    headers = game.headers 
-    game_id = headers.get("Site", "?").split("/")[-1] 
-    result = headers.get("Result", "?")
+    headers   = game.headers
+    game_id   = headers.get("Site", "?").split("/")[-1]
+    result    = headers.get("Result", "?")
     time_ctrl = headers.get("TimeControl", "?")
-    
     base, inc, tc_type = _parse_time_control(time_ctrl)
 
-    def safe_int(v): #If LiChess returns "?" for unrated players 
-        try: return int(v or 0) 
-        except: return 0 
-        
+    def safe_int(v): #If LiChess returns "?" for unrated players
+        try: return int(v or 0)
+        except: return 0
+
     white_elo = safe_int(headers.get("WhiteElo"))
     black_elo = safe_int(headers.get("BlackElo"))
-    
-    rows = [] 
-    board = game.board() 
-    ply = 0 
-    
-    for node in game.mainline(): 
-        move = node.move 
-        
-        color = "white" if board.turn == chess.WHITE else "black" 
-        fen_before = board.fen() 
-        san = board.san(move) 
 
-        clk_before = _get_clock_before(node, base) 
-        clk_after = _parse_clock(node.comment) 
-        
-        if clk_after is not None: 
-            raw_spent = clk_before - clk_after 
+    rows  = []
+    board = game.board()
+    ply   = 0
+
+    for node in game.mainline():
+        move = node.move
+
+        color      = "white" if board.turn == chess.WHITE else "black"
+        fen_before = board.fen()
+        san        = board.san(move) # must be before push
+
+        # Clock: grandparent = same player's last clock reading
+        clk_before = _get_clock_before(node, base)
+        clk_after  = _parse_clock(node.comment)
+
+        if clk_after is not None:
+            raw_spent  = clk_before - clk_after
             time_spent = round(max(0.0, raw_spent), 2)
-        else: 
-            time_spent = None 
-            
+        else:
+            time_spent = None
+
         time_spent_norm = (
             round(time_spent / base, 4)
             if time_spent is not None and base > 0
             else None
         )
-        
-        
+
+        # Eval: parent = position eval BEFORE this move (not grandparent)
+        # eval is position-based not player-specific, so parent not grandparent
+        eval_before = _parse_eval(node.parent.comment if node.parent else None)
+        eval_after  = _parse_eval(node.comment)
+
+        if eval_before is not None and eval_after is not None:
+            # Cap mate scores at 10 pawns before converting to centipawns
+            eb = max(-10.0, min(10.0, eval_before))
+            ea = max(-10.0, min(10.0, eval_after))
+            raw_cp_loss = (eb - ea) * 100  # White's perspective
+            if color == "black":
+                raw_cp_loss = -raw_cp_loss  # flip for black
+            cp_loss = round(max(0.0, min(500.0, raw_cp_loss)), 2)
+        else:
+            cp_loss = None
+
         rows.append(MoveRow(
             game_id           = game_id,
             move_number       = ply + 1,
@@ -154,64 +181,94 @@ def _parse_game(game: chess.pgn.Game) -> list[MoveRow]:
             clock_after       = clk_after,
             time_spent        = time_spent,
             time_spent_norm   = time_spent_norm,
+            eval_before       = eval_before,
+            eval_after        = eval_after,
+            cp_loss           = cp_loss,
         ))
 
         board.push(move)
-        ply += 1 
-        
-    return rows 
+        ply += 1
 
-#Parquet Writer 
+    return rows
 
-def _flush_to_parquet(rows: list[dict], base_path: str, batch_idx: int) -> None: 
-    """Write batch of move rows to compressed Parquest shard """
+
+#Parquet Writer
+def _flush_to_parquet(rows: list[dict], base_path: str, batch_idx: int) -> None:
+    """Write batch of move rows to compressed Parquet shard"""
     shard = f'{base_path}_batch{batch_idx:04d}.parquet'
-    df = pl.DataFrame(rows) 
+    df    = pl.DataFrame(rows)
     df.write_parquet(shard, compression="zstd")
     print(f"Wrote {len(df)} rows to -> {shard}")
-        
-#Game DUmp Processing 
-def process_dump(zst_path: Path, processed_dir: str, batch_size: int = 10_000) -> None: 
-    output_prefix = f"{processed_dir}/{zst_path.stem}"    
-    dctx = zstd.ZstdDecompressor() 
-    
-    print(f"Processing {zst_path.name}") 
-    games_done = 0 
-    batch_idx = 0 
-    buffer: list[dict] = [] 
-    
-    with open(zst_path, "rb") as fh: 
-        with dctx.stream_reader(fh) as reader: 
+
+
+#Parse plain .pgn files
+def parse_pgn(pgn_path: Path, processed_dir: str, batch_size: int = 10_000) -> None:
+    output_prefix = f"{processed_dir}/{pgn_path.stem}"
+
+    print(f"Parsing {pgn_path.name} ...")
+    games_done = 0
+    batch_idx  = 0
+    buffer: list[dict] = []
+
+    with open(pgn_path, encoding="utf-8", errors="replace") as fh:
+        while True:
+            game = chess.pgn.read_game(fh)
+            if game is None:
+                break
+            if game.next() is None:
+                continue
+            buffer.extend(asdict(r) for r in _parse_game(game))
+            games_done += 1
+
+            if games_done % batch_size == 0:
+                _flush_to_parquet(buffer, output_prefix, batch_idx)
+                batch_idx += 1
+                buffer = []
+                print(f"  {games_done:,} games processed ...")
+
+    if buffer:
+        _flush_to_parquet(buffer, output_prefix, batch_idx)
+
+    print(f"Done. {games_done:,} games -> {processed_dir}")
+
+
+#Game Dump Processing
+def process_dump(zst_path: Path, processed_dir: str, batch_size: int = 10_000) -> None:
+    output_prefix = f"{processed_dir}/{zst_path.stem}"
+    dctx          = zstd.ZstdDecompressor()
+
+    print(f"Processing {zst_path.name}")
+    games_done = 0
+    batch_idx  = 0
+    buffer: list[dict] = []
+
+    with open(zst_path, "rb") as fh:
+        with dctx.stream_reader(fh) as reader:
             text = io.TextIOWrapper(reader, encoding="utf-8", errors="replace")
-            
-            while True: 
-                game = chess.pgn.read_game(text) 
-                
-                if game is None: 
-                    break 
-                
-                if game.next() is None: 
-                    continue 
-                
+
+            while True:
+                game = chess.pgn.read_game(text)
+                if game is None:
+                    break
+                if game.next() is None:
+                    continue
                 buffer.extend(asdict(r) for r in _parse_game(game))
-                games_done += 1 
-                
-                if games_done % batch_size == 0: 
+                games_done += 1
+
+                if games_done % batch_size == 0:
                     _flush_to_parquet(buffer, output_prefix, batch_idx)
-                    batch_idx += 1 
-                    
-                    buffer = [] 
-                    print(f" {games_done:} games processed.")
-                
-    if buffer: 
-        _flush_to_parquet(buffer, output_prefix, batch_idx) 
-        
+                    batch_idx += 1
+                    buffer = []
+                    print(f" {games_done:,} games processed.")
+
+    if buffer:
+        _flush_to_parquet(buffer, output_prefix, batch_idx)
+
     print(f"Finishing processing {games_done} games -> {processed_dir}")
-    
+
 
 #Testing (Sample Games)
-
-def sample_games(n: int, perf_type: str, processed_dir: str) -> None: 
+def sample_games(n: int, perf_type: str, processed_dir: str) -> None:
     """Samples n games from random top player on leaderboard via berserk and writes data to parquet"""
     client = berserk.Client()
 
@@ -233,7 +290,6 @@ def sample_games(n: int, perf_type: str, processed_dir: str) -> None:
     games_done = 0
 
     for pgn_str in games_gen:
-  
         game = chess.pgn.read_game(io.StringIO(pgn_str))
         if game is None or game.next() is None:
             continue
@@ -243,9 +299,9 @@ def sample_games(n: int, perf_type: str, processed_dir: str) -> None:
     out = f"{processed_dir}/sample_{games_done}_games"
     _flush_to_parquet(buffer, out, batch_idx=0)
     print(f"Processed {games_done} games from {player} ")
-    
 
-if __name__ == "__main__": 
+
+if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Chess data ingestion — Layer 1")
 
     parser.add_argument("--raw-dir",       type=str, default="data/raw",
@@ -254,6 +310,10 @@ if __name__ == "__main__":
                         help="File directory where Parquet output goes (local path or s3://...)")
 
     sub = parser.add_subparsers(dest="cmd")
+
+    p = sub.add_parser("parse",    help="Parse a plain .pgn file to Parquet")
+    p.add_argument("path",         type=Path, help="Path to .pgn file")
+    p.add_argument("--batch-size", type=int,  default=10_000)
 
     d = sub.add_parser("dump",     help="Process a .pgn.zst dump file to Parquet")
     d.add_argument("path",         type=Path, help="Path to the .pgn.zst file")
@@ -266,13 +326,14 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    # Only mkdir for local paths — S3 has no real directories
     if not args.processed_dir.startswith("s3://"):
         Path(args.processed_dir).mkdir(parents=True, exist_ok=True)
     if not args.raw_dir.startswith("s3://"):
         Path(args.raw_dir).mkdir(parents=True, exist_ok=True)
 
-    if args.cmd == "dump":
+    if args.cmd == "parse":
+        parse_pgn(args.path, args.processed_dir, batch_size=args.batch_size)
+    elif args.cmd == "dump":
         process_dump(args.path, args.processed_dir, batch_size=args.batch_size)
     elif args.cmd == "sample":
         sample_games(n=args.n, perf_type=args.perf_type, processed_dir=args.processed_dir)
