@@ -1,0 +1,17 @@
+output_dir: data/raw
+per_bucket_limit: 5000  # games per bucket per dump file
+                        # 4 dumps × 5000 = 20,000 per bucket = 120,000 total
+
+buckets:
+  - [1000, 1200]
+  - [1200, 1500]
+  - [1500, 1800]
+  - [1800, 2100]
+  - [2100, 2400]
+  - [2400, 3000]
+
+dumps:
+  - data/raw/lichess_db_standard_rated_2018-06.pgn.zst
+  # - data/raw/lichess_db_standard_rated_2018-07.pgn.zst
+  # - data/raw/lichess_db_standard_rated_2018-08.pgn.zst
+  # - data/raw/lichess_db_standard_rated_2018-09.pgn.zst
