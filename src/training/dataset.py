@@ -200,55 +200,58 @@ class ChessGameDataset(Dataset):
         
       
         
-def collate_fn(batch: list[dict]) -> dict: 
-    """
-    Pad variable-length sequences to max-length 
-    Returns attetnion_mask 
-    """
+def collate_fn(batch):
+
     max_seq_len = max(item["seq_len"] for item in batch)
-    
-     
-    board_tensors   = []
-    time_features   = []
-    cp_losses       = []
-    white_elos      = []
-    black_elos      = []
-    attention_masks = []
-    
-    for item in batch:
+    batch_size = len(batch)
+
+    board_tensors = torch.zeros(
+        batch_size,
+        max_seq_len,
+        BOARD_CHANNELS,
+        8,
+        8
+    )
+
+    time_features = torch.zeros(
+        batch_size,
+        max_seq_len,
+        N_TIME_FEATURES
+    )
+
+    cp_losses = torch.zeros(
+        batch_size,
+        max_seq_len
+    )
+
+    attention_masks = torch.zeros(
+        batch_size,
+        max_seq_len
+    )
+
+    white_elos = []
+    black_elos = []
+
+    for i, item in enumerate(batch):
         seq_len = item["seq_len"]
-        pad     = max_seq_len - seq_len
- 
-        # Pad with zeros at end
-        bt = item["board_tensors"]
-        tf = item["time_features"]
-        cp = item["cp_loss"]
- 
-        if pad > 0:
-            bt = torch.cat([bt, torch.zeros(pad, BOARD_CHANNELS, 8, 8)])
-            tf = torch.cat([tf, torch.zeros(pad, N_TIME_FEATURES)])
-            cp = torch.cat([cp, torch.zeros(pad)])
- 
-        board_tensors.append(bt)
-        time_features.append(tf)
-        cp_losses.append(cp)
+
+        board_tensors[i, :seq_len] = item["board_tensors"]
+        time_features[i, :seq_len] = item["time_features"]
+        cp_losses[i, :seq_len] = item["cp_loss"]
+
+        attention_masks[i, :seq_len] = 1
+
         white_elos.append(item["white_elo"])
         black_elos.append(item["black_elo"])
- 
-        attention_masks.append(torch.cat([
-            torch.ones(seq_len),
-            torch.zeros(pad),
-        ]))
- 
+
     return {
-        "board_tensors":  torch.stack(board_tensors),    # (B, T, 17, 8, 8)
-        "time_features":  torch.stack(time_features),    # (B, T, 3)
-        "cp_loss":        torch.stack(cp_losses),        # (B, T)
-        "white_elo":      torch.stack(white_elos),       # (B,)
-        "black_elo":      torch.stack(black_elos),       # (B,)
-        "attention_mask": torch.stack(attention_masks),  # (B, T)
+        "board_tensors": board_tensors,
+        "time_features": time_features,
+        "cp_loss": cp_losses,
+        "white_elo": torch.stack(white_elos),
+        "black_elo": torch.stack(black_elos),
+        "attention_mask": attention_masks,
     }
-    
  
 if __name__ == "__main__":
     from torch.utils.data import DataLoader

@@ -118,14 +118,25 @@ def run(
     test_ds  = ChessGameDataset(features_path, split="test")
 
     train_loader = DataLoader(
-        train_ds, batch_size=batch_size, shuffle=True,
-        collate_fn=collate_fn, num_workers=0, pin_memory=False,
-    )
-    test_loader = DataLoader(
-        test_ds, batch_size=batch_size * 2, shuffle=False,
-        collate_fn=collate_fn, num_workers=0,
+        train_ds,
+        batch_size=batch_size,
+        shuffle=True,
+        collate_fn=collate_fn,
+        num_workers=4,
+        pin_memory=(device.type == "cuda"),
+        persistent_workers=True,
+        prefetch_factor=2,
     )
 
+    test_loader = DataLoader(
+        test_ds,
+        batch_size=batch_size * 2,
+        shuffle=False,
+        collate_fn=collate_fn,
+        num_workers=4,
+        persistent_workers=True,
+        prefetch_factor=2,
+    )
     model = ChessTransformer(
         d_model=d_model, n_heads=n_heads,
         n_layers=n_layers, d_ff=d_model * 4,
