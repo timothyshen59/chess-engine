@@ -268,11 +268,13 @@ def run(
 
 
     loader_kw = dict(
-        collate_fn=collate_fn,
-        num_workers=0,
-        pin_memory=use_amp
+    collate_fn         = collate_fn,
+    num_workers        = 4,
+    pin_memory         = True,
+    prefetch_factor    = 2,
+    persistent_workers = True,
     )
-
+    
 
     train_loader = DataLoader(
         train_ds,
