@@ -1,18 +1,8 @@
-"""
-train_transformer.py — Training loop for Elo prediction transformer.
-
-Transformer predicts white_elo + black_elo from game sequence.
-Move quality annotation is handled by Stockfish separately.
-
-Usage:
-  uv run src/training/train_transformer.py
-  uv run src/training/train_transformer.py --epochs 20 --batch-size 32
-"""
-
 import sys
 import json
 import argparse
 from pathlib import Path
+from contextlib import nullcontext
 
 import torch
 import torch.nn as nn
@@ -24,180 +14,131 @@ from dataset import ChessGameDataset, collate_fn
 from model   import ChessTransformer
 
 
-def train_one_epoch(
-    model:     ChessTransformer,
-    loader:    DataLoader,
-    optimizer: torch.optim.Optimizer,
-    device:    torch.device,
-    epoch:     int,
-) -> dict:
+def get_device() -> tuple[torch.device, bool]:
+    if torch.cuda.is_available():
+        torch.backends.cuda.enable_flash_sdp(True)
+        return torch.device("cuda"), True
+    if torch.backends.mps.is_available():
+        return torch.device("mps"), False
+    return torch.device("cpu"), False
+
+
+def unwrap(model: nn.Module) -> nn.Module:
+    return model._orig_mod if hasattr(model, "_orig_mod") else model
+
+
+def train_one_epoch(model, loader, optimizer, scaler, device, amp_ctx, epoch) -> float:
     model.train()
     criterion  = nn.L1Loss()
     total_loss = 0.0
-    n_batches  = 0
-
-    pbar = tqdm(loader, desc=f"Epoch {epoch:02d}", leave=True)
+    pbar       = tqdm(loader, desc=f"Epoch {epoch:02d}", leave=True)
 
     for batch in pbar:
-        board_tensors  = batch["board_tensors"].to(device)
-        time_features  = batch["time_features"].to(device)
-        attention_mask = batch["attention_mask"].to(device)
-        white_elo      = batch["white_elo"].to(device)
-        black_elo      = batch["black_elo"].to(device)
+        bt  = batch["board_tensors"].to(device, non_blocking=True)
+        tf  = batch["time_features"].to(device, non_blocking=True)
+        msk = batch["attention_mask"].to(device, non_blocking=True)
+        elo = torch.stack([
+            batch["white_elo"].to(device, non_blocking=True),
+            batch["black_elo"].to(device, non_blocking=True),
+        ], dim=1)
 
-        elo_pred = model(board_tensors, time_features, attention_mask)
+        optimizer.zero_grad(set_to_none=True)
 
-        elo_true = torch.stack([white_elo, black_elo], dim=1)  # (B, 2)
-        loss     = criterion(elo_pred, elo_true)
+        with amp_ctx:
+            loss = criterion(model(bt, tf, msk), elo)
 
-        optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
+        if scaler:
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
 
         total_loss += loss.item()
-        n_batches  += 1
+        pbar.set_postfix({"loss": f"{total_loss / (pbar.n or 1):.1f}"})
 
-        pbar.set_postfix({"elo_loss": f"{total_loss / n_batches:.1f}"})
-
-    return {"elo_loss": total_loss / n_batches}
+    return total_loss / len(loader)
 
 
-def evaluate(
-    model:  ChessTransformer,
-    loader: DataLoader,
-    device: torch.device,
-) -> dict:
+@torch.no_grad()
+def evaluate(model, loader, device, amp_ctx) -> float:
     model.eval()
+    total_mae, n = 0.0, 0
 
-    total_elo_mae = 0.0
-    n_games       = 0
+    for batch in tqdm(loader, desc="Eval", leave=False):
+        bt  = batch["board_tensors"].to(device, non_blocking=True)
+        tf  = batch["time_features"].to(device, non_blocking=True)
+        msk = batch["attention_mask"].to(device, non_blocking=True)
+        we  = batch["white_elo"].to(device, non_blocking=True)
+        be  = batch["black_elo"].to(device, non_blocking=True)
 
-    pbar = tqdm(loader, desc="Evaluating", leave=False)
+        with amp_ctx:
+            pred = model(bt, tf, msk)
 
-    with torch.no_grad():
-        for batch in pbar:
-            board_tensors  = batch["board_tensors"].to(device)
-            time_features  = batch["time_features"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
-            white_elo      = batch["white_elo"].to(device)
-            black_elo      = batch["black_elo"].to(device)
+        total_mae += ((torch.abs(pred[:, 0] - we) + torch.abs(pred[:, 1] - be)) / 2).sum().item()
+        n         += len(we)
 
-            elo_pred = model(board_tensors, time_features, attention_mask)
-
-            white_mae = torch.abs(elo_pred[:, 0] - white_elo)
-            black_mae = torch.abs(elo_pred[:, 1] - black_elo)
-            elo_mae   = ((white_mae + black_mae) / 2).sum()
-
-            total_elo_mae += elo_mae.item()
-            n_games       += len(white_elo)
-
-    return {"elo_mae": total_elo_mae / max(n_games, 1)}
+    return total_mae / max(n, 1)
 
 
-def run(
-    features_path: str,
-    models_dir:    str,
-    epochs:        int,
-    batch_size:    int,
-    lr:            float,
-    d_model:       int,
-    n_heads:       int,
-    n_layers:      int,
-):
-    if torch.backends.mps.is_available():
-        device = torch.device("mps")
-    elif torch.cuda.is_available():
-        device = torch.device("cuda")
-    else:
-        device = torch.device("cpu")
-    print(f"Device: {device}")
+def run(features_path, models_dir, epochs, batch_size, lr, d_model, n_heads, n_layers, max_games):
+    device, use_amp = get_device()
+    amp_ctx = torch.autocast(device_type="cuda", dtype=torch.float16) if use_amp else nullcontext()
+    scaler  = torch.cuda.amp.GradScaler() if use_amp else None
+    print(f"Device: {device} | AMP: {use_amp}")
 
-    print("\nLoading datasets ...")
-    train_ds = ChessGameDataset(features_path, split="train")
-    test_ds  = ChessGameDataset(features_path, split="test")
+    train_ds = ChessGameDataset(features_path, split="train", max_games=max_games)
+    test_ds  = ChessGameDataset(features_path, split="test",  max_games=max_games)
 
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=batch_size,
-        shuffle=True,
-        collate_fn=collate_fn,
-        num_workers=4,
-        pin_memory=(device.type == "cuda"),
-        persistent_workers=True,
-        prefetch_factor=2,
-    )
+    loader_kw = dict(collate_fn=collate_fn, num_workers=0, pin_memory=use_amp)
+    train_loader = DataLoader(train_ds, batch_size=batch_size,     shuffle=True,  **loader_kw)
+    test_loader  = DataLoader(test_ds,  batch_size=batch_size * 2, shuffle=False, **loader_kw)
 
-    test_loader = DataLoader(
-        test_ds,
-        batch_size=batch_size * 2,
-        shuffle=False,
-        collate_fn=collate_fn,
-        num_workers=4,
-        persistent_workers=True,
-        prefetch_factor=2,
-    )
-    model = ChessTransformer(
-        d_model=d_model, n_heads=n_heads,
-        n_layers=n_layers, d_ff=d_model * 4,
-    ).to(device)
-
-    print(f"Parameters: {sum(p.numel() for p in model.parameters()):,}")
+    model = ChessTransformer(d_model=d_model, n_heads=n_heads, n_layers=n_layers, d_ff=d_model * 4).to(device)
+    if use_amp:
+        model = torch.compile(model)
+    print(f"Params: {sum(p.numel() for p in model.parameters()):,}")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
     Path(models_dir).mkdir(parents=True, exist_ok=True)
-    best_elo_mae = float("inf")
-    history      = []
+    best, history = float("inf"), []
 
-    print(f"\nTraining for {epochs} epochs ...")
     for epoch in range(1, epochs + 1):
-        train_metrics = train_one_epoch(model, train_loader, optimizer, device, epoch)
-        eval_metrics  = evaluate(model, test_loader, device)
+        loss    = train_one_epoch(model, train_loader, optimizer, scaler, device, amp_ctx, epoch)
+        mae     = evaluate(model, test_loader, device, amp_ctx)
         scheduler.step()
 
-        row = {
-            "epoch": epoch,
-            "lr":    scheduler.get_last_lr()[0],
-            **{f"train_{k}": v for k, v in train_metrics.items()},
-            **{f"val_{k}":   v for k, v in eval_metrics.items()},
-        }
-        history.append(row)
+        history.append({"epoch": epoch, "loss": loss, "elo_mae": mae})
+        print(f"Epoch {epoch:02d} | loss {loss:.1f} | elo_mae {mae:.1f}")
 
-        print(f"Epoch {epoch:02d} | elo_mae {eval_metrics['elo_mae']:.1f}")
+        if mae < best:
+            best = mae
+            torch.save(unwrap(model).state_dict(), f"{models_dir}/transformer_best.pt")
+            print(f"  ✓ best saved (elo_mae={best:.1f})")
 
-        if eval_metrics["elo_mae"] < best_elo_mae:
-            best_elo_mae = eval_metrics["elo_mae"]
-            torch.save(model.state_dict(), f"{models_dir}/transformer_best.pt")
-            print(f"  ✓ best model saved (elo_mae={best_elo_mae:.1f})")
-
-    torch.save(model.state_dict(), f"{models_dir}/transformer_final.pt")
+    torch.save(unwrap(model).state_dict(), f"{models_dir}/transformer_final.pt")
     with open(f"{models_dir}/transformer_history.json", "w") as f:
         json.dump(history, f, indent=2)
-
-    print(f"\nDone. Best elo_mae: {best_elo_mae:.1f}")
+    print(f"\nDone. Best elo_mae: {best:.1f}")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Chess transformer — Elo prediction")
-    parser.add_argument("--features-path", type=str,   default="data/features/features.parquet")
-    parser.add_argument("--models-dir",    type=str,   default="models")
-    parser.add_argument("--epochs",        type=int,   default=10)
-    parser.add_argument("--batch-size",    type=int,   default=32)
-    parser.add_argument("--lr",            type=float, default=1e-4)
-    parser.add_argument("--d-model",       type=int,   default=256)
-    parser.add_argument("--n-heads",       type=int,   default=4)
-    parser.add_argument("--n-layers",      type=int,   default=4)
-    args = parser.parse_args()
-
-    run(
-        features_path=args.features_path,
-        models_dir=args.models_dir,
-        epochs=args.epochs,
-        batch_size=args.batch_size,
-        lr=args.lr,
-        d_model=args.d_model,
-        n_heads=args.n_heads,
-        n_layers=args.n_layers,
-    )
+    p = argparse.ArgumentParser()
+    p.add_argument("--features-path", default="data/features/features.parquet")
+    p.add_argument("--models-dir",    default="models")
+    p.add_argument("--epochs",        type=int,   default=10)
+    p.add_argument("--batch-size",    type=int,   default=32)
+    p.add_argument("--lr",            type=float, default=1e-4)
+    p.add_argument("--d-model",       type=int,   default=256)
+    p.add_argument("--n-heads",       type=int,   default=4)
+    p.add_argument("--n-layers",      type=int,   default=4)
+    p.add_argument("--max-games",     type=int,   default=None)
+    args = p.parse_args()
+    run(args.features_path, args.models_dir, args.epochs, args.batch_size,
+        args.lr, args.d_model, args.n_heads, args.n_layers, args.max_games)
