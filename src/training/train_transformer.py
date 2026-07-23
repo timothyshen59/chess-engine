@@ -85,14 +85,14 @@ def evaluate(model, loader, device, amp_ctx) -> float:
     return total_mae / max(n, 1)
 
 
-def run(features_path, models_dir, epochs, batch_size, lr, d_model, n_heads, n_layers, max_games):
+def run(features_path, models_dir, epochs, batch_size, lr, d_model, n_heads, n_layers):
     device, use_amp = get_device()
     amp_ctx = torch.autocast(device_type="cuda", dtype=torch.float16) if use_amp else nullcontext()
     scaler  = torch.cuda.amp.GradScaler() if use_amp else None
     print(f"Device: {device} | AMP: {use_amp}")
 
-    train_ds = ChessGameDataset(features_path, split="train", max_games=max_games)
-    test_ds  = ChessGameDataset(features_path, split="test",  max_games=max_games)
+    train_ds = ChessGameDataset(features_path, split="train")
+    test_ds  = ChessGameDataset(features_path, split="test")
 
     loader_kw = dict(collate_fn=collate_fn, num_workers=0, pin_memory=use_amp)
     train_loader = DataLoader(train_ds, batch_size=batch_size,     shuffle=True,  **loader_kw)
@@ -138,7 +138,6 @@ if __name__ == "__main__":
     p.add_argument("--d-model",       type=int,   default=256)
     p.add_argument("--n-heads",       type=int,   default=4)
     p.add_argument("--n-layers",      type=int,   default=4)
-    p.add_argument("--max-games",     type=int,   default=None)
     args = p.parse_args()
     run(args.features_path, args.models_dir, args.epochs, args.batch_size,
-        args.lr, args.d_model, args.n_heads, args.n_layers, args.max_games)
+        args.lr, args.d_model, args.n_heads, args.n_layers)
