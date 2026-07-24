@@ -16,6 +16,7 @@ data/processed/
 data/features/
 data/labels/
 data/evals/
+data/training_store
 
 # Model weights
 models/
