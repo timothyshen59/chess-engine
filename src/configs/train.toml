@@ -5,7 +5,7 @@ models_dir = "models/colab_run_001"
 [training]
 epochs = 10
 batch_size = 128
-num_workers = 2
+num_workers = 8
 shuffle_buffer = 10000
 learning_rate = 0.0001
 
